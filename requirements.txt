@@ -1,0 +1,5 @@
+torch>=2.3
+sentencepiece
+numpy
+tqdm
+matplotlib
