@@ -12,7 +12,7 @@ os.makedirs(os.path.dirname(model_prefix), exist_ok=True)
 spm.SentencePieceTrainer.train(
     input=input_file,
     model_prefix=model_prefix,
-    vocab_size=32000,
+    vocab_size=model_config.vocab_size,
     model_type="bpe",
     character_coverage=1.0,
 )
