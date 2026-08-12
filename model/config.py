@@ -1,16 +1,20 @@
 from dataclasses import dataclass
 
+import torch
+
+
+_DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+
 
 @dataclass
 class ModelConfig:
-
-    # tokenizer
+    """模型结构超参数。"""
+    # 词表大小与上下文窗口长度
     vocab_size: int = 32000
 
-    # context length
     max_seq_len: int = 1024
 
-    # Transformer size
+    # Transformer 层数、注意力头数和隐藏维度
     n_layer: int = 8
     n_head: int = 8
     hidden_dim: int = 512
@@ -20,7 +24,7 @@ class ModelConfig:
 
 @dataclass
 class TrainConfig:
-
+    """训练过程超参数。"""
     batch_size: int = 16
 
     learning_rate: float = 3e-4
@@ -37,5 +41,4 @@ class TrainConfig:
 
 
 model_config = ModelConfig()
-
 train_config = TrainConfig()

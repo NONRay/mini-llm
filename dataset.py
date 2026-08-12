@@ -11,6 +11,7 @@ class TextDataset(Dataset):
     """
 
     def __init__(self, path, seq_len):
+        """加载 memmap，避免将完整语料一次性读入内存。"""
         self.data = np.memmap(
             path,
             dtype=np.uint32,
@@ -22,6 +23,7 @@ class TextDataset(Dataset):
         return max(0, len(self.data) - self.seq_len - 1)
 
     def __getitem__(self, idx):
+        """返回错位一位的输入与 next-token 监督标签。"""
         chunk = self.data[idx : idx + self.seq_len + 1].astype(np.int64)
         x = torch.tensor(chunk[:-1])
         y = torch.tensor(chunk[1:])
