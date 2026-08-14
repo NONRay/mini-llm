@@ -22,12 +22,13 @@ tokenizer = spm.SentencePieceProcessor(
 model = MiniLLM(model_config).to(device)
 
 
-model.load_state_dict(
-    torch.load(
-        str(ROOT / "checkpoint_epoch9.pt"),
-        map_location=device,
-    )
+checkpoint = torch.load(
+    str(ROOT / "checkpoints/latest.pt"),
+    map_location=device,
 )
+
+state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+model.load_state_dict(state_dict)
 
 
 model.eval()

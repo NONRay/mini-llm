@@ -24,7 +24,10 @@ class TextDataset(Dataset):
 
     def __getitem__(self, idx):
         """返回错位一位的输入与 next-token 监督标签。"""
-        chunk = self.data[idx : idx + self.seq_len + 1].astype(np.int64)
-        x = torch.tensor(chunk[:-1])
-        y = torch.tensor(chunk[1:])
+        chunk = np.asarray(
+            self.data[idx : idx + self.seq_len + 1],
+            dtype=np.int64,
+        )
+        x = torch.from_numpy(chunk[:-1].copy())
+        y = torch.from_numpy(chunk[1:].copy())
         return x, y

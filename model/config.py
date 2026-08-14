@@ -25,7 +25,9 @@ class ModelConfig:
 @dataclass
 class TrainConfig:
     """训练过程超参数。"""
-    batch_size: int = 16
+    batch_size: int = 8
+
+    grad_accum_steps: int = 8
 
     learning_rate: float = 3e-4
 
@@ -36,6 +38,18 @@ class TrainConfig:
     grad_clip: float = 1.0
 
     weight_decay: float = 0.1
+
+    num_workers: int = 4
+
+    log_interval: int = 20
+
+    save_every_epochs: int = 1
+
+    checkpoint_dir: str = "checkpoints"
+
+    seed: int = 42
+
+    compile_model: bool = True
 
     device: str = _DEFAULT_DEVICE
 
