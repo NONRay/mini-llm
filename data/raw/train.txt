@@ -1,5 +1,0 @@
-Artificial intelligence is changing the world.
-
-Machine learning models learn representations from data.
-
-Transformers use attention mechanisms.

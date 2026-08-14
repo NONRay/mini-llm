@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 
 import sentencepiece as spm
+from model.config import model_config
 
 ROOT = Path(__file__).resolve().parent.parent
 

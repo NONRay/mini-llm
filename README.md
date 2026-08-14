@@ -56,7 +56,23 @@ pip install -r requirements.txt
 
 ## Usage
 
-### 1. Train the tokenizer
+### 1. Download and clean the raw corpus
+
+```bash
+python scripts/download_chinese_c4.py
+```
+
+Downloads `shjwudp/chinese-c4` from Hugging Face, normalizes the `text` field into plain text,
+and writes the result to `data/raw/train.txt`.
+
+Useful options:
+
+```bash
+python scripts/download_chinese_c4.py --limit 100000
+python scripts/download_chinese_c4.py --output /tmp/chinese_c4.txt
+```
+
+### 2. Train the tokenizer
 
 ```bash
 python scripts/train_tokenizer.py
@@ -64,7 +80,7 @@ python scripts/train_tokenizer.py
 
 Trains a SentencePiece BPE tokenizer on `data/raw/train.txt` and saves `data/tokenizer/tokenizer.model`.
 
-### 2. Prepare the dataset
+### 3. Prepare the dataset
 
 ```bash
 python scripts/prepare_data.py
@@ -72,7 +88,7 @@ python scripts/prepare_data.py
 
 Tokenizes the raw text and writes `data/processed/train.bin` as a `uint32` memmap array.
 
-### 3. Train the model
+### 4. Train the model
 
 ```bash
 python training/train.py
@@ -80,7 +96,7 @@ python training/train.py
 
 Runs the training loop (AdamW, gradient clipping) and saves a checkpoint per epoch (`checkpoint_epochN.pt`).
 
-### 4. Generate text
+### 5. Generate text
 
 ```bash
 python inference.py

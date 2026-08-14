@@ -1,5 +1,8 @@
 torch>=2.3
 sentencepiece
+datasets
+zstandard
+hf_xet
 numpy
 tqdm
 matplotlib

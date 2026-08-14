@@ -48,6 +48,12 @@ checkpoints/
 # Training data (large files)
 *.npy
 *.npz
+data/raw/train.txt
+data/raw/*.zst
+data/cache/
+data/processed/
+data/tokenizer/
+logs/
 
 # Jupyter
 .ipynb_checkpoints/
