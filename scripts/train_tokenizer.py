@@ -1,12 +1,13 @@
 import argparse
+import sys
 from pathlib import Path
 
 import sentencepiece as spm
 
-from model.config import model_config
-
-
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from model.config import model_config
 
 
 def parse_args():

@@ -97,6 +97,12 @@ def parse_args():
         help="Optional cap on optimizer steps, useful for smoke tests.",
     )
     parser.add_argument(
+        "--save-every-steps",
+        type=int,
+        default=None,
+        help="Save a checkpoint every N optimizer steps.",
+    )
+    parser.add_argument(
         "--resume",
         type=Path,
         default=None,
@@ -267,6 +273,10 @@ def main():
                     f"lr={scheduler.get_last_lr()[0]:.6e} "
                     f"samples={samples_seen} elapsed_s={elapsed:.1f}"
                 )
+
+            if args.save_every_steps is not None and global_step % args.save_every_steps == 0:
+                save_checkpoint(args.checkpoint_dir / "latest.pt", model, optimizer, scheduler, epoch, global_step, args)
+                print(f"Saved checkpoint at step={global_step}")
 
         checkpoint_path = args.checkpoint_dir / f"checkpoint_epoch{epoch}.pt"
         save_checkpoint(checkpoint_path, model, optimizer, scheduler, epoch, global_step, args)
