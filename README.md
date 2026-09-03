@@ -37,9 +37,11 @@ dropout      0.1
 │   └── train.py           # Training loop (AdamW + grad clip)
 ├── inference.py           # Text generation (sampling)
 ├── scripts/
-│   ├── train_tokenizer.py # Train BPE tokenizer
-│   ├── prepare_data.py    # Tokenize raw text -> train.bin (memmap)
-│   └── evaluate.py        # Compute average loss
+│   ├── download_fineweb_edu.py  # Download Chinese Fineweb Edu (high-quality curated corpus)
+│   ├── download_chinese_c4.py   # Download Chinese C4 (alternative raw web corpus)
+│   ├── train_tokenizer.py       # Train BPE tokenizer
+│   ├── prepare_data.py          # Tokenize raw text -> train.bin (memmap)
+│   └── evaluate.py              # Compute average loss
 ├── analysis/
 │   ├── activation.py      # Extract per-layer hidden states
 │   └── attention_map.py   # Visualize attention weights
@@ -58,18 +60,27 @@ pip install -r requirements.txt
 
 ### 1. Download and clean the raw corpus
 
+**Recommended: Chinese Fineweb Edu** (high-quality, education-filtered corpus):
+
 ```bash
-python scripts/download_chinese_c4.py
+python scripts/download_fineweb_edu.py
 ```
 
-Downloads `shjwudp/chinese-c4` from Hugging Face, normalizes the `text` field into plain text,
-and writes the result to `data/raw/train.txt`.
+Downloads `opencsg/chinese-fineweb-edu` from Hugging Face. This dataset is filtered by
+an educational-value scoring model (score > 4) and deduplicated via MinHash, making it
+well-suited for small models where data quality matters more than scale.
 
 Useful options:
 
 ```bash
-python scripts/download_chinese_c4.py --limit 100000
-python scripts/download_chinese_c4.py --output /tmp/chinese_c4.txt
+python scripts/download_fineweb_edu.py --limit 500000
+python scripts/download_fineweb_edu.py --output /tmp/fineweb_edu.txt
+```
+
+**Alternative: Chinese C4** (raw web crawl, lower quality):
+
+```bash
+python scripts/download_chinese_c4.py
 ```
 
 ### 2. Train the tokenizer
