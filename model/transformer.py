@@ -29,5 +29,9 @@ class MiniLLM(nn.Module):
         logits = self.lm_head(self.norm(x))
         loss = None
         if targets is not None:
-            loss = nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            loss = nn.functional.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-100,
+            )
         return (logits, loss, hidden) if return_hidden else (logits, loss)

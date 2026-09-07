@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from dataset import TextDataset
+from dataset import SFTDataset, TextDataset
 from model.config import model_config, train_config
 from model.transformer import MiniLLM
 
@@ -24,6 +24,18 @@ def parse_args():
         type=Path,
         default=ROOT / "data/processed/train.bin",
         help="Path to the tokenized uint32 corpus.",
+    )
+    parser.add_argument(
+        "--sft-jsonl",
+        type=Path,
+        default=None,
+        help="Optional normalized SFT JSONL path. When set, only assistant tokens contribute to loss.",
+    )
+    parser.add_argument(
+        "--tokenizer",
+        type=Path,
+        default=ROOT / "data/tokenizer/tokenizer.model",
+        help="Tokenizer path used for SFT JSONL training.",
     )
     parser.add_argument(
         "--device",
@@ -172,7 +184,22 @@ def main():
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
 
-    dataset = TextDataset(str(args.train_bin), model_config.max_seq_len)
+    collate_fn = None
+    if args.sft_jsonl is not None:
+        dataset = SFTDataset(
+            path=str(args.sft_jsonl),
+            tokenizer_path=str(args.tokenizer),
+            seq_len=model_config.max_seq_len,
+        )
+        collate_fn = dataset.collate_fn
+        print(f"Using SFT dataset: {args.sft_jsonl} (samples={len(dataset)})")
+    else:
+        dataset = TextDataset(str(args.train_bin), model_config.max_seq_len)
+        print(f"Using pretraining corpus: {args.train_bin} (windows={len(dataset)})")
+
+    if len(dataset) == 0:
+        raise ValueError("Dataset is empty. Check the input path and sequence length.")
+
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -180,6 +207,7 @@ def main():
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
         persistent_workers=args.num_workers > 0,
+        collate_fn=collate_fn,
     )
 
     raw_model = MiniLLM(model_config).to(device)
