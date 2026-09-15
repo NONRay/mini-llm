@@ -44,6 +44,8 @@ Thumbs.db
 *.ckpt
 *.pth
 checkpoints/
+checkpoints_sft_debug/
+checkpoints_sft_smoke/
 
 # Training data (large files)
 *.npy
@@ -62,3 +64,7 @@ logs/
 *.log
 wandb/
 runs/
+
+# debug
+.dbg/
+debug-sft-train-infer.md

@@ -1,8 +1,10 @@
 import argparse
+import json
 import math
 import random
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +17,40 @@ sys.path.insert(0, str(ROOT))
 from dataset import SFTDataset, TextDataset
 from model.config import model_config, train_config
 from model.transformer import MiniLLM
+
+
+def _debug_event(hypothesis_id: str, location: str, msg: str, data: dict):
+    # #region debug-point shared:train-debug
+    _p = ROOT / ".dbg" / "sft-train-infer.env"
+    _u = "http://127.0.0.1:7777/event"
+    _s = "sft-train-infer"
+    try:
+        content = _p.read_text(encoding="utf-8")
+        for line in content.splitlines():
+            if line.startswith("DEBUG_SERVER_URL="):
+                _u = line.split("=", 1)[1]
+            elif line.startswith("DEBUG_SESSION_ID="):
+                _s = line.split("=", 1)[1]
+        payload = {
+            "sessionId": _s,
+            "runId": "pre-fix",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "msg": f"[DEBUG] {msg}",
+            "data": data,
+            "ts": int(time.time() * 1000),
+        }
+        urllib.request.urlopen(
+            urllib.request.Request(
+                _u,
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+            ),
+            timeout=1,
+        ).read()
+    except Exception:
+        pass
+    # #endregion
 
 
 def parse_args():
@@ -209,6 +245,21 @@ def main():
         persistent_workers=args.num_workers > 0,
         collate_fn=collate_fn,
     )
+    # #region debug-point A:dataset-and-steps
+    _debug_event(
+        "A",
+        "training/train.py:loader",
+        "training loader built",
+        {
+            "sft_mode": args.sft_jsonl is not None,
+            "dataset_len": len(dataset),
+            "batch_size": args.batch_size,
+            "grad_accum_steps": args.grad_accum_steps,
+            "loader_len": len(loader),
+            "device": str(device),
+        },
+    )
+    # #endregion
 
     raw_model = MiniLLM(model_config).to(device)
     model = raw_model
@@ -228,6 +279,19 @@ def main():
     if args.max_steps is not None:
         total_updates = min(total_updates, args.max_steps)
     scheduler = build_scheduler(optimizer, args.warmup_steps, total_updates)
+    # #region debug-point A:update-plan
+    _debug_event(
+        "A",
+        "training/train.py:scheduler",
+        "computed planned updates",
+        {
+            "updates_per_epoch": updates_per_epoch,
+            "total_updates": total_updates,
+            "epochs": args.epochs,
+            "max_steps": args.max_steps,
+        },
+    )
+    # #endregion
 
     amp_dtype = pick_amp_dtype(device)
     scaler = None
@@ -253,10 +317,16 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         epoch_loss = 0.0
         epoch_updates = 0
+        accum_counter = 0
+        accum_target = None
 
         for step, (x, y) in enumerate(loader):
             if args.max_steps is not None and global_step >= args.max_steps:
                 break
+
+            if accum_counter == 0:
+                remaining_batches = len(loader) - step
+                accum_target = min(args.grad_accum_steps, remaining_batches)
 
             x = x.to(device, non_blocking=device.type == "cuda")
             y = y.to(device, non_blocking=device.type == "cuda")
@@ -264,14 +334,15 @@ def main():
             autocast_enabled = amp_dtype is not None
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=autocast_enabled):
                 _, loss = model(x, y)
-                loss = loss / args.grad_accum_steps
+                loss = loss / accum_target
 
             if scaler is not None:
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
 
-            if (step + 1) % args.grad_accum_steps != 0:
+            accum_counter += 1
+            if accum_counter < accum_target:
                 continue
 
             if scaler is not None:
@@ -290,7 +361,23 @@ def main():
 
             global_step += 1
             epoch_updates += 1
-            epoch_loss += loss.item() * args.grad_accum_steps
+            epoch_loss += loss.item() * accum_target
+            accum_counter = 0
+            accum_target = None
+            # #region debug-point C:optimizer-step
+            if global_step <= 5:
+                _debug_event(
+                    "C",
+                    "training/train.py:optimizer-step",
+                    "optimizer step executed",
+                    {
+                        "epoch": epoch,
+                        "step": step,
+                        "global_step": global_step,
+                        "loss": float(loss.item() * args.grad_accum_steps),
+                    },
+                )
+            # #endregion
 
             if global_step % args.log_interval == 0:
                 elapsed = time.time() - run_start
@@ -307,6 +394,20 @@ def main():
                 print(f"Saved checkpoint at step={global_step}")
 
         checkpoint_path = args.checkpoint_dir / f"checkpoint_epoch{epoch}.pt"
+        # #region debug-point A:epoch-summary
+        _debug_event(
+            "A",
+            "training/train.py:epoch-end",
+            "epoch finished",
+            {
+                "epoch": epoch,
+                "epoch_updates": epoch_updates,
+                "global_step": global_step,
+                "loader_len": len(loader),
+                "remainder_batches": len(loader) % args.grad_accum_steps,
+            },
+        )
+        # #endregion
         save_checkpoint(checkpoint_path, model, optimizer, scheduler, epoch, global_step, args)
         save_checkpoint(args.checkpoint_dir / "latest.pt", model, optimizer, scheduler, epoch, global_step, args)
         print(f"Saved checkpoint to {checkpoint_path}")
