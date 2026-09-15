@@ -37,20 +37,22 @@ ENV/
 .DS_Store
 Thumbs.db
 
-# Model weights / checkpoints
+# Model weights / checkpoints（按训练阶段分目录）
 *.pt
 *.bin
 *.safetensors
 *.ckpt
 *.pth
 checkpoints/
-checkpoints_sft_debug/
-checkpoints_sft_smoke/
+checkpoints_pretrain/
+checkpoints_sft*/
 
 # Training data (large files)
 *.npy
 *.npz
 data/raw/train.txt
+data/raw/*_normalized.jsonl
+data/raw/*_train.txt
 data/raw/*.zst
 data/cache/
 data/processed/
@@ -67,4 +69,4 @@ runs/
 
 # debug
 .dbg/
-debug-sft-train-infer.md
+debug-*.md

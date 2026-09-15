@@ -1,7 +1,9 @@
 import argparse
+import ast
 import json
 import random
 import re
+from collections import defaultdict
 from pathlib import Path
 from typing import Iterable
 
@@ -34,6 +36,12 @@ def parse_args():
         type=str,
         default=None,
         help="Optional Hugging Face dataset config name.",
+    )
+    parser.add_argument(
+        "--hf-configs",
+        type=str,
+        default=None,
+        help="Optional comma-separated Hugging Face dataset config names.",
     )
     parser.add_argument(
         "--hf-split",
@@ -76,6 +84,13 @@ def parse_args():
         default=42,
         help="Random seed used when shuffling.",
     )
+    parser.add_argument(
+        "--sample-strategy",
+        type=str,
+        choices=["sequential", "coig_cqia_balanced"],
+        default="sequential",
+        help="Sampling strategy used before writing outputs.",
+    )
     return parser.parse_args()
 
 
@@ -101,6 +116,58 @@ def format_sample(system_prompt: str, instruction: str, output: str) -> str:
         f"用户：{instruction}\n\n"
         f"助手：{output}"
     )
+
+
+def parse_literal(value):
+    if isinstance(value, (dict, list, tuple)):
+        return value
+    if not isinstance(value, str):
+        return value
+    value = value.strip()
+    if not value:
+        return value
+    try:
+        return ast.literal_eval(value)
+    except (ValueError, SyntaxError):
+        return value
+
+
+def normalize_string_list(value) -> list[str]:
+    value = parse_literal(value)
+    if value is None:
+        return []
+    if isinstance(value, str):
+        cleaned = clean_text(value)
+        return [cleaned] if cleaned else []
+    if isinstance(value, (list, tuple, set)):
+        normalized = []
+        for item in value:
+            cleaned = clean_text(item)
+            if cleaned:
+                normalized.append(cleaned)
+        return normalized
+    return [clean_text(value)]
+
+
+def normalize_task_type(task_type) -> dict[str, list[str]]:
+    parsed = parse_literal(task_type)
+    if isinstance(parsed, dict):
+        major = normalize_string_list(parsed.get("major"))
+        minor = normalize_string_list(parsed.get("minor"))
+        return {"major": major, "minor": minor}
+    return {"major": [], "minor": []}
+
+
+def parse_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes"}:
+            return True
+        if lowered in {"false", "0", "no", ""}:
+            return False
+    return bool(value)
 
 
 def parse_messages(messages, source: str) -> list[dict]:
@@ -149,7 +216,24 @@ def parse_messages(messages, source: str) -> list[dict]:
     return normalized
 
 
-def normalize_record(record: dict, default_system_prompt: str, source: str) -> list[dict]:
+def enrich_sample_metadata(sample: dict, record: dict, source: str, source_config: str | None) -> dict:
+    task_type = normalize_task_type(record.get("task_type"))
+    sample["task_type"] = task_type
+    sample["domain"] = normalize_string_list(record.get("domain"))
+    sample["answer_from"] = clean_text(record.get("answer_from") or "")
+    sample["human_verified"] = parse_bool(record.get("human_verified"))
+    sample["copyright"] = clean_text(record.get("copyright") or "")
+    sample["source"] = source
+    sample["source_config"] = source_config or ""
+    return sample
+
+
+def normalize_record(
+    record: dict,
+    default_system_prompt: str,
+    source: str,
+    source_config: str | None = None,
+) -> list[dict]:
     if "messages" in record:
         return parse_messages(record["messages"], source)
     if "conversations" in record:
@@ -180,10 +264,9 @@ def normalize_record(record: dict, default_system_prompt: str, source: str) -> l
         "instruction": instruction,
         "input": extra_input,
         "output": output,
-        "source": source,
     }
     sample["text"] = format_sample(system_prompt, instruction, output)
-    return [sample]
+    return [enrich_sample_metadata(sample, record, source, source_config)]
 
 
 def iter_local_records(path: Path) -> Iterable[dict]:
@@ -195,28 +278,108 @@ def iter_local_records(path: Path) -> Iterable[dict]:
             yield json.loads(line)
 
 
-def iter_hf_records(dataset_name: str, config_name: str | None, split_name: str) -> Iterable[dict]:
-    dataset = load_dataset(dataset_name, config_name, split=split_name)
-    for row in dataset:
-        yield dict(row)
+def parse_hf_configs(config_name: str | None, config_names: str | None) -> list[str | None]:
+    if config_names:
+        configs = [item.strip() for item in config_names.split(",") if item.strip()]
+        return configs
+    return [config_name]
+
+
+def iter_hf_records(
+    dataset_name: str,
+    config_name: str | None,
+    config_names: str | None,
+    split_name: str,
+) -> Iterable[tuple[dict, str | None]]:
+    configs = parse_hf_configs(config_name, config_names)
+    for cfg in configs:
+        dataset = load_dataset(dataset_name, cfg, split=split_name)
+        for row in dataset:
+            yield dict(row), cfg
+
+
+def select_coig_cqia_balanced(samples: list[dict], limit: int | None, seed: int) -> list[dict]:
+    if limit is None or len(samples) <= limit:
+        return samples
+
+    rng = random.Random(seed)
+    subset_buckets: dict[str, dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
+
+    for sample in samples:
+        subset = sample.get("source_config") or "default"
+        minors = sample.get("task_type", {}).get("minor") or ["未分类"]
+        bucket_key = " | ".join(minors)
+        subset_buckets[subset][bucket_key].append(sample)
+
+    subset_names = list(subset_buckets.keys())
+    for subset_name in subset_names:
+        for bucket_name in subset_buckets[subset_name]:
+            rng.shuffle(subset_buckets[subset_name][bucket_name])
+
+    subset_round_robin = {
+        subset_name: sorted(subset_buckets[subset_name].keys())
+        for subset_name in subset_names
+    }
+    subset_bucket_index = {subset_name: 0 for subset_name in subset_names}
+    selected = []
+    seen_texts = set()
+
+    while len(selected) < limit:
+        progressed = False
+        for subset_name in subset_names:
+            bucket_names = subset_round_robin[subset_name]
+            if not bucket_names:
+                continue
+
+            for _ in range(len(bucket_names)):
+                idx = subset_bucket_index[subset_name] % len(bucket_names)
+                bucket_name = bucket_names[idx]
+                subset_bucket_index[subset_name] = idx + 1
+                bucket = subset_buckets[subset_name][bucket_name]
+                if not bucket:
+                    continue
+
+                sample = bucket.pop()
+                text = sample["text"]
+                if text in seen_texts:
+                    continue
+
+                seen_texts.add(text)
+                selected.append(sample)
+                progressed = True
+                break
+
+            if len(selected) >= limit:
+                break
+
+        if not progressed:
+            break
+
+    return selected
 
 
 def collect_samples(args) -> list[dict]:
     if args.hf_dataset:
-        records = iter_hf_records(args.hf_dataset, args.hf_config, args.hf_split)
+        records = iter_hf_records(
+            args.hf_dataset,
+            args.hf_config,
+            args.hf_configs,
+            args.hf_split,
+        )
         source_name = args.hf_dataset
     else:
-        records = iter_local_records(args.input_jsonl)
+        records = ((record, None) for record in iter_local_records(args.input_jsonl))
         source_name = str(args.input_jsonl.name)
 
     samples = []
     seen_texts = set()
 
-    for record in records:
+    for record, source_config in records:
         normalized_records = normalize_record(
             record=record,
             default_system_prompt=args.system_prompt,
             source=source_name,
+            source_config=source_config,
         )
         for sample in normalized_records:
             text = sample["text"]
@@ -225,8 +388,11 @@ def collect_samples(args) -> list[dict]:
             seen_texts.add(text)
             samples.append(sample)
 
-            if args.limit is not None and len(samples) >= args.limit:
+            if args.limit is not None and args.sample_strategy == "sequential" and len(samples) >= args.limit:
                 return samples
+
+    if args.sample_strategy == "coig_cqia_balanced":
+        return select_coig_cqia_balanced(samples, args.limit, args.seed)
 
     return samples
 

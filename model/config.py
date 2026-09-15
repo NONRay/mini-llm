@@ -29,11 +29,22 @@ class TrainConfig:
 
     grad_accum_steps: int = 8
 
+    # ---- 预训练阶段默认值 ----
     learning_rate: float = 3e-4
 
     epochs: int = 5
 
     warmup_steps: int = 1000
+
+    # 预训练默认每 N 步刷新一次 latest.pt，避免长训时只能按 epoch 存盘
+    pretrain_save_every_steps: int = 2000
+
+    # ---- SFT 阶段默认值（在预训练 checkpoint 之上微调） ----
+    sft_learning_rate: float = 5e-5
+
+    sft_epochs: int = 3
+
+    sft_warmup_steps: int = 30
 
     grad_clip: float = 1.0
 

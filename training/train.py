@@ -1,10 +1,8 @@
 import argparse
-import json
 import math
 import random
 import sys
 import time
-import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -17,40 +15,6 @@ sys.path.insert(0, str(ROOT))
 from dataset import SFTDataset, TextDataset
 from model.config import model_config, train_config
 from model.transformer import MiniLLM
-
-
-def _debug_event(hypothesis_id: str, location: str, msg: str, data: dict):
-    # #region debug-point shared:train-debug
-    _p = ROOT / ".dbg" / "sft-train-infer.env"
-    _u = "http://127.0.0.1:7777/event"
-    _s = "sft-train-infer"
-    try:
-        content = _p.read_text(encoding="utf-8")
-        for line in content.splitlines():
-            if line.startswith("DEBUG_SERVER_URL="):
-                _u = line.split("=", 1)[1]
-            elif line.startswith("DEBUG_SESSION_ID="):
-                _s = line.split("=", 1)[1]
-        payload = {
-            "sessionId": _s,
-            "runId": "pre-fix",
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "msg": f"[DEBUG] {msg}",
-            "data": data,
-            "ts": int(time.time() * 1000),
-        }
-        urllib.request.urlopen(
-            urllib.request.Request(
-                _u,
-                data=json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json"},
-            ),
-            timeout=1,
-        ).read()
-    except Exception:
-        pass
-    # #endregion
 
 
 def parse_args():
@@ -93,20 +57,23 @@ def parse_args():
     parser.add_argument(
         "--epochs",
         type=int,
-        default=train_config.epochs,
-        help="Number of epochs.",
+        default=None,
+        help="Number of epochs. Defaults: pretrain=%d, SFT=%d."
+        % (train_config.epochs, train_config.sft_epochs),
     )
     parser.add_argument(
         "--learning-rate",
         type=float,
-        default=train_config.learning_rate,
-        help="Peak learning rate after warmup.",
+        default=None,
+        help="Peak learning rate after warmup. Defaults: pretrain=%g, SFT=%g."
+        % (train_config.learning_rate, train_config.sft_learning_rate),
     )
     parser.add_argument(
         "--warmup-steps",
         type=int,
-        default=train_config.warmup_steps,
-        help="Learning-rate warmup steps.",
+        default=None,
+        help="Learning-rate warmup steps. Defaults: pretrain=%d, SFT=%d."
+        % (train_config.warmup_steps, train_config.sft_warmup_steps),
     )
     parser.add_argument(
         "--weight-decay",
@@ -135,8 +102,8 @@ def parse_args():
     parser.add_argument(
         "--checkpoint-dir",
         type=Path,
-        default=ROOT / train_config.checkpoint_dir,
-        help="Directory for checkpoints.",
+        default=None,
+        help="Directory for checkpoints. Defaults: pretrain=checkpoints_pretrain/, SFT=checkpoints_sft/.",
     )
     parser.add_argument(
         "--max-steps",
@@ -148,7 +115,8 @@ def parse_args():
         "--save-every-steps",
         type=int,
         default=None,
-        help="Save a checkpoint every N optimizer steps.",
+        help="Save latest.pt every N optimizer steps. Defaults: pretrain=%d, SFT=per-epoch only."
+        % train_config.pretrain_save_every_steps,
     )
     parser.add_argument(
         "--resume",
@@ -215,6 +183,32 @@ def main():
     device = torch.device(args.device)
     set_seed(train_config.seed)
 
+    # 阶段由是否传入 --sft-jsonl 决定，并据此填充各自的默认超参和 checkpoint 目录
+    sft_mode = args.sft_jsonl is not None
+    stage = "sft" if sft_mode else "pretrain"
+
+    if args.checkpoint_dir is None:
+        args.checkpoint_dir = ROOT / ("checkpoints_sft" if sft_mode else "checkpoints_pretrain")
+    if args.epochs is None:
+        args.epochs = train_config.sft_epochs if sft_mode else train_config.epochs
+    if args.learning_rate is None:
+        args.learning_rate = train_config.sft_learning_rate if sft_mode else train_config.learning_rate
+    if args.warmup_steps is None:
+        args.warmup_steps = train_config.sft_warmup_steps if sft_mode else train_config.warmup_steps
+    if args.save_every_steps is None and not sft_mode:
+        args.save_every_steps = train_config.pretrain_save_every_steps
+
+    print(
+        f"Stage: {stage} | checkpoint_dir={args.checkpoint_dir} | "
+        f"lr={args.learning_rate:g} epochs={args.epochs} warmup={args.warmup_steps} "
+        f"save_every_steps={args.save_every_steps}"
+    )
+    if sft_mode and args.resume is None:
+        print(
+            "WARNING: SFT is starting from random initialization. "
+            "Pass --resume checkpoints_pretrain/latest.pt to fine-tune the pretrained base."
+        )
+
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -245,22 +239,6 @@ def main():
         persistent_workers=args.num_workers > 0,
         collate_fn=collate_fn,
     )
-    # #region debug-point A:dataset-and-steps
-    _debug_event(
-        "A",
-        "training/train.py:loader",
-        "training loader built",
-        {
-            "sft_mode": args.sft_jsonl is not None,
-            "dataset_len": len(dataset),
-            "batch_size": args.batch_size,
-            "grad_accum_steps": args.grad_accum_steps,
-            "loader_len": len(loader),
-            "device": str(device),
-        },
-    )
-    # #endregion
-
     raw_model = MiniLLM(model_config).to(device)
     model = raw_model
     if train_config.compile_model and not args.no_compile and hasattr(torch, "compile"):
@@ -279,19 +257,6 @@ def main():
     if args.max_steps is not None:
         total_updates = min(total_updates, args.max_steps)
     scheduler = build_scheduler(optimizer, args.warmup_steps, total_updates)
-    # #region debug-point A:update-plan
-    _debug_event(
-        "A",
-        "training/train.py:scheduler",
-        "computed planned updates",
-        {
-            "updates_per_epoch": updates_per_epoch,
-            "total_updates": total_updates,
-            "epochs": args.epochs,
-            "max_steps": args.max_steps,
-        },
-    )
-    # #endregion
 
     amp_dtype = pick_amp_dtype(device)
     scaler = None
@@ -302,13 +267,26 @@ def main():
     global_step = 0
 
     if args.resume is not None:
-        checkpoint = torch.load(args.resume, map_location=device)
+        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
         raw_model.load_state_dict(checkpoint["model"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        scheduler.load_state_dict(checkpoint["scheduler"])
-        start_epoch = checkpoint["epoch"] + 1
-        global_step = checkpoint["global_step"]
-        print(f"Resumed from {args.resume} at epoch={start_epoch} step={global_step}")
+        resume_args = checkpoint.get("train_args") or {}
+        resume_sft = bool(resume_args.get("sft_jsonl"))
+        same_stage = resume_sft == sft_mode
+
+        if same_stage:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            scheduler.load_state_dict(checkpoint["scheduler"])
+            start_epoch = checkpoint["epoch"] + 1
+            global_step = checkpoint["global_step"]
+            print(f"Resumed from {args.resume} at epoch={start_epoch} step={global_step}")
+        else:
+            # 跨阶段（如 pretrain -> SFT）：只加载模型权重，
+            # 优化器/调度器/epoch 计数全部重新开始，避免沿用旧阶段的学习率轨迹
+            print(
+                f"Loaded model weights from {args.resume} "
+                f"({'sft' if resume_sft else 'pretrain'} -> {stage}); "
+                "optimizer/scheduler reset, epochs restart from 0"
+            )
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -364,20 +342,6 @@ def main():
             epoch_loss += loss.item() * accum_target
             accum_counter = 0
             accum_target = None
-            # #region debug-point C:optimizer-step
-            if global_step <= 5:
-                _debug_event(
-                    "C",
-                    "training/train.py:optimizer-step",
-                    "optimizer step executed",
-                    {
-                        "epoch": epoch,
-                        "step": step,
-                        "global_step": global_step,
-                        "loss": float(loss.item() * args.grad_accum_steps),
-                    },
-                )
-            # #endregion
 
             if global_step % args.log_interval == 0:
                 elapsed = time.time() - run_start
@@ -394,20 +358,6 @@ def main():
                 print(f"Saved checkpoint at step={global_step}")
 
         checkpoint_path = args.checkpoint_dir / f"checkpoint_epoch{epoch}.pt"
-        # #region debug-point A:epoch-summary
-        _debug_event(
-            "A",
-            "training/train.py:epoch-end",
-            "epoch finished",
-            {
-                "epoch": epoch,
-                "epoch_updates": epoch_updates,
-                "global_step": global_step,
-                "loader_len": len(loader),
-                "remainder_batches": len(loader) % args.grad_accum_steps,
-            },
-        )
-        # #endregion
         save_checkpoint(checkpoint_path, model, optimizer, scheduler, epoch, global_step, args)
         save_checkpoint(args.checkpoint_dir / "latest.pt", model, optimizer, scheduler, epoch, global_step, args)
         print(f"Saved checkpoint to {checkpoint_path}")
