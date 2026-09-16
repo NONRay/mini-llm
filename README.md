@@ -160,6 +160,27 @@ python inference.py --prompt "请简要介绍一下人工智能。"
 
 Each checkpoint stores `model`, `optimizer`, `scheduler`, `epoch`, `global_step`, `model_config`, and `train_args` (used to detect the stage on resume).
 
+## Reference run
+
+Results from a complete pretrain → SFT cycle on a single GPU, as a calibration point for future runs:
+
+| Stage | Steps | Wall clock | Loss | Notes |
+|---|---|---|---|---|
+| Pretrain | 268,000 | ~26.6 h | ~3.85 (plateaued) | ~17.5B tokens seen (≈38 passes over the 460M-token corpus); effective batch 8×8×1024 ≈ 65k tokens/step; ~2.8 steps/s |
+| SFT | 234 (3 epochs × 78) | ~2 min | 4.53 → ~3.6 | Initial SFT loss ~4.5 confirms the pretrained base was loaded (vs ~350 when training from scratch) |
+
+Observed behavior:
+
+- **Base model** (`checkpoints_pretrain/latest.pt`): fluent grammar, but rambles in web-corpus style and ignores questions — the expected state before alignment.
+- **SFT model** (`checkpoints_sft/latest.pt`): answer-style responses within the `系统：/用户：/助手：` template, stops at EOS.
+- **Known limitations at this scale**: domain-skewed knowledge (the corpus sample is agriculture-heavy), occasional UNK tokens (`⁇`) from vocab coverage, and token repetition. Repetition can be mitigated at inference time with `--temperature 0.7 --top-k 20 --repetition-penalty 1.2`.
+
+Practical notes:
+
+- One DataLoader "epoch" of the sliding-window corpus ≈ 7.15M optimizer steps, so bound pretraining with `--max-steps` rather than `--epochs`. At this scale the cosine schedule stays near peak LR the whole run (total steps are effectively infinite), which is why loss plateaus — that is normal.
+- `Ctrl+C` is safe during pretraining: `checkpoints_pretrain/latest.pt` is refreshed every 2000 steps, and `--resume checkpoints_pretrain/latest.pt` continues the run.
+- Suggested next steps in order of impact: broaden pretrain corpus diversity (fixes domain skew), scale SFT data toward 20k–50k examples, then tune sampling params.
+
 ## License
 
 MIT
