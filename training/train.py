@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from dataset import SFTDataset, TextDataset
+from dataset import BlockShuffleSampler, SFTDataset, TextDataset
 from model.config import model_config, train_config
 from model.transformer import MiniLLM
 
@@ -230,10 +230,16 @@ def main():
     if len(dataset) == 0:
         raise ValueError("Dataset is empty. Check the input path and sequence length.")
 
+    train_sampler = None
+    if args.sft_jsonl is None:
+        train_sampler = BlockShuffleSampler(len(dataset), seed=train_config.seed)
+        print(f"Using block-shuffle sampler: block={train_sampler.block_size:,} seed={train_sampler.seed}")
+
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
         persistent_workers=args.num_workers > 0,
@@ -293,6 +299,8 @@ def main():
     run_start = time.time()
 
     for epoch in range(start_epoch, args.epochs):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         epoch_loss = 0.0
         epoch_updates = 0
         accum_counter = 0

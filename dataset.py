@@ -3,7 +3,7 @@ import json
 import numpy as np
 import sentencepiece as spm
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 
 class TextDataset(Dataset):
@@ -34,6 +34,36 @@ class TextDataset(Dataset):
         x = torch.from_numpy(chunk[:-1].copy())
         y = torch.from_numpy(chunk[1:].copy())
         return x, y
+
+
+class BlockShuffleSampler(Sampler):
+    """分块洗牌：块间乱序 + 块内乱序，近似全局洗牌且内存占用恒定。
+
+    避免内置 RandomSampler 对 21 亿窗口做 randperm+tolist 时
+    需要数十 GB 内存而被 OOM-kill 的问题。
+    """
+
+    def __init__(self, num_samples, block_size=5_000_000, seed=42):
+        self.num_samples = num_samples
+        self.block_size = block_size
+        self.seed = seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        starts = np.arange(0, self.num_samples, self.block_size)
+        rng.shuffle(starts)
+        for start in starts:
+            stop = min(start + self.block_size, self.num_samples)
+            block = np.arange(start, stop)
+            rng.shuffle(block)
+            yield from block.tolist()
+
+    def __len__(self):
+        return self.num_samples
 
 
 class SFTDataset(Dataset):
