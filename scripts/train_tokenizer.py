@@ -36,6 +36,12 @@ def parse_args():
         default=8,
         help="SentencePiece worker threads.",
     )
+    parser.add_argument(
+        "--input-sentence-size",
+        type=int,
+        default=5_000_000,
+        help="Randomly sample N sentences for tokenizer training (0 = use all).",
+    )
     return parser.parse_args()
 
 
@@ -50,6 +56,8 @@ def main():
         model_type="bpe",
         character_coverage=1.0,
         num_threads=args.num_threads,
+        input_sentence_size=args.input_sentence_size,
+        shuffle_input_sentence=True,
     )
 
     print(f"Saved tokenizer to {args.model_prefix}.model")
