@@ -57,6 +57,9 @@ data/raw/*.zst
 data/cache/
 data/processed/
 data/tokenizer/
+data/psycho/pdf/
+data/psycho/markdown/_mineru_tmp/
+data/psycho/llm_clean/
 logs/
 
 # Jupyter
@@ -70,3 +73,6 @@ runs/
 # debug
 .dbg/
 debug-*.md
+
+# MinerU local content cache
+/blobs/

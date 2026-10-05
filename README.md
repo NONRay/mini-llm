@@ -41,6 +41,9 @@ dropout      0.1
 ├── scripts/
 │   ├── download_fineweb_edu.py  # Download Chinese Fineweb Edu (pretrain corpus)
 │   ├── download_chinese_c4.py   # Download Chinese C4 (alternative corpus)
+│   ├── convert_psycho_pdfs.py    # Convert psychology PDFs to Markdown
+│   ├── prepare_psycho_data.py    # Clean Markdown into a plain-text corpus
+│   ├── quality_filter_psycho.py  # LLM-based OCR quality filter for psychology corpus
 │   ├── train_tokenizer.py       # Train BPE tokenizer
 │   ├── prepare_data.py          # Tokenize raw text -> train.bin (memmap)
 │   ├── prepare_sft_data.py      # Normalize instruction data (local / COIG-CQIA)
@@ -51,6 +54,9 @@ dropout      0.1
 ├── checkpoints_pretrain/  # Stage 1 outputs (auto-created)
 ├── checkpoints_sft/       # Stage 2 outputs (auto-created)
 ├── data/
+│   ├── psycho/
+│   │   ├── pdf/           # Local source PDFs (gitignored)
+│   │   └── markdown/      # Converted Markdown (committed)
 │   └── raw/               # Corpora & SFT JSONL (generated, gitignored)
 └── requirements.txt
 ```
@@ -58,8 +64,15 @@ dropout      0.1
 ## Setup
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
+
+The virtual environment is local-only: `.venv/`, `venv/`, and similar environment
+directories are excluded by `.gitignore`. Reactivate it with
+`source .venv/bin/activate` whenever you open a new shell.
 
 ## Pipeline
 
@@ -72,6 +85,53 @@ python scripts/download_fineweb_edu.py            # or download_chinese_c4.py
 python scripts/train_tokenizer.py                 # -> data/tokenizer/tokenizer.model
 python scripts/prepare_data.py                    # -> data/processed/train.bin
 ```
+
+**Psychology corpus** (optional domain pretraining data):
+
+Place source PDFs in `data/psycho/pdf/`. The PDFs stay local and are excluded from
+Git; converted files under `data/psycho/markdown/` are committed instead.
+
+```bash
+pip install "markitdown[pdf]"
+
+# Text PDFs use MarkItDown; scanned PDFs fall back to a local MinerU installation.
+python scripts/convert_psycho_pdfs.py
+
+# NFKC normalization, Markdown removal, control-character cleanup, and deduplication.
+python scripts/prepare_psycho_data.py              # -> data/raw/psycho_train.txt
+
+# Optional: polish each chunk with a local LLM (OpenAI-compatible API) for OCR/watermark
+# cleanup. Outputs are cached per book under data/psycho/llm_clean/ (gitignored), so the
+# run is resumable. A bigram fidelity gate falls back to the rule-cleaned text whenever
+# the model paraphrases or fabricates content.
+python scripts/prepare_psycho_data.py --llm \
+  --api-base http://127.0.0.1:1137/v1 \
+  --model Jan-v3.5-4B-Q4_K_XL \
+  --max-workers 2                                  # -> data/raw/psycho_train.txt
+
+# Optional: LLM-based OCR quality filter.  Requires a local OpenAI-compatible server.
+# Chunks each Markdown file and asks the model to label each chunk keep/drop/review.
+# Drops labeled "drop" with confidence >= 0.85 are excluded; everything else is kept.
+# Results are cached in the audit JSONL so interrupted runs resume where they left off.
+OPENAI_API_KEY=EMPTY python scripts/quality_filter_psycho.py \
+  --model <model-name> \
+  --base-url http://127.0.0.1:8000/v1   # -> data/raw/psycho_train_qc.txt
+                                         #    data/raw/psycho_qc_audit.jsonl
+
+# Build a tokenizer and token corpus specifically from the psychology material.
+# Substitute psycho_train_qc.txt for psycho_train.txt if you ran the quality filter.
+python scripts/train_tokenizer.py \
+  --input data/raw/psycho_train.txt \
+  --model-prefix data/tokenizer/psycho_tokenizer
+python scripts/prepare_data.py \
+  --input data/raw/psycho_train.txt \
+  --tokenizer data/tokenizer/psycho_tokenizer.model \
+  --output data/processed/psycho_train.bin
+```
+
+`convert_psycho_pdfs.py` skips existing Markdown files, so interrupted conversion
+can be resumed by running the same command. Use `--mode mineru --mineru-args "-l ch"`
+to send all remaining files directly through MinerU OCR.
 
 **SFT data** — COIG-CQIA via HF mirror, balanced-sampled to 5000 examples across all 13 subsets (30 major / 122 minor task types):
 
