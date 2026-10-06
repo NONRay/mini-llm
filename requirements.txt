@@ -1,4 +1,7 @@
 torch>=2.3
+transformers>=4.51,<4.57
+accelerate
+safetensors
 sentencepiece
 datasets
 zstandard

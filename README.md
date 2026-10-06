@@ -44,6 +44,8 @@ dropout      0.1
 │   ├── convert_psycho_pdfs.py    # Convert psychology PDFs to Markdown
 │   ├── prepare_psycho_data.py    # Clean Markdown into a plain-text corpus
 │   ├── quality_filter_psycho.py  # LLM-based OCR quality filter for psychology corpus
+│   ├── run_psycho_pretrain_prep.sh # Persistent GPU cleaning/QC pipeline
+│   ├── export_book.py            # Export one reviewed book for inspection
 │   ├── train_tokenizer.py       # Train BPE tokenizer
 │   ├── prepare_data.py          # Tokenize raw text -> train.bin (memmap)
 │   ├── prepare_sft_data.py      # Normalize instruction data (local / COIG-CQIA)
@@ -57,7 +59,7 @@ dropout      0.1
 │   ├── psycho/
 │   │   ├── pdf/           # Local source PDFs (gitignored)
 │   │   └── markdown/      # Converted Markdown (committed)
-│   └── raw/               # Corpora & SFT JSONL (generated, gitignored)
+│   └── raw/               # Reviewed datasets allowlisted; other outputs ignored
 └── requirements.txt
 ```
 
@@ -86,52 +88,156 @@ python scripts/train_tokenizer.py                 # -> data/tokenizer/tokenizer.
 python scripts/prepare_data.py                    # -> data/processed/train.bin
 ```
 
-**Psychology corpus** (optional domain pretraining data):
+### Psychology corpus: PDF to reviewed pretraining text
 
-Place source PDFs in `data/psycho/pdf/`. The PDFs stay local and are excluded from
-Git; converted files under `data/psycho/markdown/` are committed instead.
+This repository includes a reproducible OCR-cleaning pipeline for psychology books.
+The central design is to separate **deterministic cleaning** from **model-based
+quality decisions**:
+
+- Rules remove artifacts whose form is known: Markdown syntax, page markers,
+  repeated headers/footers, isolated page numbers, hard line breaks, and broken
+  English words.
+- Qwen3-8B only decides whether a chunk is useful (`keep`, `drop`, or `review`).
+  It does not rewrite the source, which avoids silently introducing hallucinations.
+
+#### Step 1: Convert PDFs to Markdown
+
+Put local PDFs in `data/psycho/pdf/`, then run:
 
 ```bash
 pip install "markitdown[pdf]"
-
-# Text PDFs use MarkItDown; scanned PDFs fall back to a local MinerU installation.
 python scripts/convert_psycho_pdfs.py
+```
 
-# NFKC normalization, Markdown removal, control-character cleanup, and deduplication.
-python scripts/prepare_psycho_data.py              # -> data/raw/psycho_train.txt
+Text PDFs use MarkItDown; scanned PDFs fall back to MinerU. Existing Markdown files
+are skipped, so rerunning resumes rather than starting over. To force remaining
+files through OCR:
 
-# Optional: polish each chunk with a local LLM (OpenAI-compatible API) for OCR/watermark
-# cleanup. Outputs are cached per book under data/psycho/llm_clean/ (gitignored), so the
-# run is resumable. A bigram fidelity gate falls back to the rule-cleaned text whenever
-# the model paraphrases or fabricates content.
-python scripts/prepare_psycho_data.py --llm \
-  --api-base http://127.0.0.1:1137/v1 \
-  --model Jan-v3.5-4B-Q4_K_XL \
-  --max-workers 2                                  # -> data/raw/psycho_train.txt
+```bash
+python scripts/convert_psycho_pdfs.py --mode mineru --mineru-args "-l ch"
+```
 
-# Optional: LLM-based OCR quality filter.  Requires a local OpenAI-compatible server.
-# Chunks each Markdown file and asks the model to label each chunk keep/drop/review.
-# Drops labeled "drop" with confidence >= 0.85 are excluded; everything else is kept.
-# Results are cached in the audit JSONL so interrupted runs resume where they left off.
-OPENAI_API_KEY=EMPTY python scripts/quality_filter_psycho.py \
-  --model <model-name> \
-  --base-url http://127.0.0.1:8000/v1   # -> data/raw/psycho_train_qc.txt
-                                         #    data/raw/psycho_qc_audit.jsonl
+Markdown is committed because it is searchable and diffable. Source PDFs and MinerU
+temporary fragments remain local.
 
-# Build a tokenizer and token corpus specifically from the psychology material.
-# Substitute psycho_train_qc.txt for psycho_train.txt if you ran the quality filter.
+#### Step 2: Apply deterministic text cleaning
+
+```bash
+python scripts/prepare_psycho_data.py
+# output: data/raw/psycho_train.txt (local intermediate file)
+```
+
+The cleaner:
+
+1. Uses NFC Unicode normalization. NFKC is deliberately avoided because it changes
+   Chinese punctuation such as `，；：（）` into ASCII punctuation.
+2. Removes Markdown/HTML syntax and `<!-- page N of M -->` markers.
+3. Detects isolated page-number lines and repeated short headers/footers.
+4. Joins lines split by page layout while preserving paragraphs and headings.
+5. Repairs English line wrapping without splitting words, and inserts missing
+   spaces after Latin punctuation.
+6. Normalizes ASCII punctuation only in an unambiguous Chinese context, while
+   leaving citations such as `S.Freud,1856` unchanged.
+
+This stage is deterministic and fast. Inspect it before spending GPU time on review.
+
+#### Step 3: Review chunks with local Qwen3-8B
+
+The tested model path is `/root/autodl-tmp/models/Qwen3-8B`. Local inference is
+forced onto `cuda:0`; the script exits instead of silently falling back to CPU.
+
+Run the complete pipeline as a persistent background job:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 nohup \
+  scripts/run_psycho_pretrain_prep.sh \
+  </dev/null >/dev/null 2>&1 & echo $!
+```
+
+The wrapper verifies CUDA allocation, rebuilds the rule-cleaned text, then runs Qwen
+review. It is safe to disconnect from SSH.
+
+Chunks are at most 1800 characters. Long English paragraphs are cut at sentence
+boundaries or spaces, never inside a word. A `drop` decision is accepted only at
+confidence `>= 0.85`; lower-confidence drops become `review` and remain in the
+corpus. Invalid JSON is parsed defensively, retried, and ultimately retained as
+`review` instead of stopping the run.
+
+| File | Purpose | Git policy |
+|---|---|---|
+| `data/raw/psycho_train.txt` | Rule-cleaned intermediate corpus | ignored |
+| `data/raw/psycho_train_qc.txt` | Final reviewed pretraining text | committed |
+| `data/raw/psycho_qc_audit.jsonl` | One decision per current chunk | committed |
+| `logs/psycho_prep_*.log` | Runtime progress and warnings | ignored |
+
+Successful completion compacts the audit file, removing stale decisions from older
+cleaning or chunking versions.
+
+#### Step 4: Monitor and resume
+
+```bash
+# Follow the newest log.
+tail -f "$(ls -t logs/psycho_prep_*.log | head -1)"
+
+# Check process and GPU activity.
+ps aux | grep quality_filter_psycho | grep -v grep
+watch -n 5 nvidia-smi
+```
+
+The audit is flushed after every decision. If interrupted, launch the same command:
+matching chunks are loaded from cache. The final corpus is written through a
+temporary file and atomically renamed, so an interruption cannot publish a partial
+result.
+
+#### Step 5: Inspect or export one book
+
+```bash
+# Deterministic cleaning only.
+python scripts/export_book.py \
+  --book "20世纪西方现代心理学--人类心灵的神话：荣格的分析心理学.md" \
+  --clean-only
+
+# Export the Qwen-reviewed version.
+python scripts/export_book.py \
+  --book "20世纪西方现代心理学--人类心灵的神话：荣格的分析心理学.md"
+```
+
+Exports under `data/raw/psycho_books/` are inspection artifacts and are ignored.
+The exporter validates cache keys rather than trusting chunk indexes, so old
+decisions cannot be applied to newly cleaned text.
+
+#### Step 6: Validate the final corpus
+
+The reference run processed 51 books:
+
+| Decision | Chunks |
+|---|---:|
+| keep | 5,541 |
+| review (kept) | 1,070 |
+| drop | 581 |
+| total | 7,192 |
+
+Validation found no HTML page markers, known `Thi` / `s` English word splits, or
+`measure.For` joins, and confirmed restoration of Chinese punctuation. The reviewed
+corpus is approximately 28.7 MB.
+
+#### Step 7: Build tokenizer and binary training data
+
+Tokenizer models and `.bin` files are local build artifacts:
+
+```bash
 python scripts/train_tokenizer.py \
-  --input data/raw/psycho_train.txt \
+  --input data/raw/psycho_train_qc.txt \
   --model-prefix data/tokenizer/psycho_tokenizer
+
 python scripts/prepare_data.py \
-  --input data/raw/psycho_train.txt \
+  --input data/raw/psycho_train_qc.txt \
   --tokenizer data/tokenizer/psycho_tokenizer.model \
   --output data/processed/psycho_train.bin
 ```
 
-`convert_psycho_pdfs.py` skips existing Markdown files, so interrupted conversion
-can be resumed by running the same command. Use `--mode mineru --mineru-args "-l ch"`
-to send all remaining files directly through MinerU OCR.
+Before distributing Markdown or reviewed text, verify that you have the right to
+redistribute the underlying books. This pipeline does not grant content licenses.
 
 **SFT data** — COIG-CQIA via HF mirror, balanced-sampled to 5000 examples across all 13 subsets (30 major / 122 minor task types):
 

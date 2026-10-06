@@ -5,10 +5,12 @@ import time
 import unicodedata
 import urllib.error
 import urllib.request
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable, Optional
 
+import torch
 from tqdm import tqdm
 
 
@@ -18,6 +20,7 @@ DEFAULT_OUTPUT = ROOT / "data/raw/psycho_train.txt"
 DEFAULT_LLM_CACHE = ROOT / "data/psycho/llm_clean"
 DEFAULT_API_BASE = "http://127.0.0.1:1137/v1"
 DEFAULT_MODEL = "Jan-v3.5-4B-Q4_K_XL"
+DEFAULT_HF_MODEL_PATH = ROOT.parent / "models/Qwen3-8B"
 
 LLM_SYSTEM_PROMPT = (
     "你负责清洗扫描版PDF转出的书籍文本。你的输出将被逐字对照检查，必须严格保留原文全部内容与段落顺序，只允许做以下处理：\n"
@@ -38,10 +41,90 @@ BLOCKQUOTE_RE = re.compile(r"^\s{0,3}>\s?")
 LIST_MARKER_RE = re.compile(r"^\s*(?:[-+*]|\d+[.)])\s+")
 TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*$")
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
+HTML_COMMENT_RE = re.compile(r"<!--.*?-->")
+MD_ESCAPE_RE = re.compile(r"\\([\\`*_{}\[\]()+\-!~#%&<>|])")
+LATIN_PUNCTUATION_SPACE_RE = re.compile(
+    r"(?<=[,;:!?])(?=[A-Za-z])|(?<=[a-z)])\.(?=[A-Z])"
+)
+CJK_RANGE = r"\u3400-\u4dbf\u4e00-\u9fff"
+CJK_CONTEXT_PUNCTUATION_RE = re.compile(
+    rf"(?<=[{CJK_RANGE}])[,;:!?]|[,;:!?](?=[{CJK_RANGE}])"
+)
+CJK_CONTEXT_PERIOD_RE = re.compile(
+    rf"(?<=[{CJK_RANGE}])\.(?=[{CJK_RANGE}])"
+)
+CJK_NUMBERED_ITEM_RE = re.compile(r"\((\d{1,3})\)")
+DECORATION_RE = re.compile(r"^[\s\-—–_·•.。○〇*#>|]+|[\s\-—–_·•.。○〇*#>|]+$")
+PAGE_LABEL_RE = re.compile(r"^第\s*\d{1,4}\s*页(?:\s*共\s*\d{1,4}\s*页)?$")
+PAGE_RATIO_RE = re.compile(r"^\d{1,4}\s*/\s*\d{1,4}$")
+
+TERMINAL_PUNCTUATION = "。．！？；：…”』」!?;:"
+STRUCTURE_START_RE = re.compile(
+    r"^(?:"
+    r"[（(][一二三四五六七八九十百\d]+[)）]"
+    r"|[一二三四五六七八九十]+\s*、"
+    r"|第\s*[一二三四五六七八九十百千\d]+\s*[章节篇卷部讲]"
+    r"|[\d]{1,2}\s*[、.．]"
+    r"|[●•◆★△▲□■◇※]"
+    r"|[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮]"
+    r")"
+)
+FOOTNOTE_START_RE = re.compile(r"^\[?\^?\d{1,2}[\].:：]?\s+[A-Z“\"'‘]")
+ASCII_TO_CJK_PUNCTUATION = str.maketrans({
+    ",": "，",
+    ";": "；",
+    ":": "：",
+    "!": "！",
+    "?": "？",
+})
+_LOCAL_MODEL = None
+_LOCAL_TOKENIZER = None
+
+
+def require_cuda() -> None:
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA 初始化失败。本地模型必须使用 GPU；若 nvidia-smi 能看到显卡，"
+            "请在未受 Trae 命令沙箱限制的 SSH 终端运行。"
+        )
+    try:
+        torch.empty(1, device="cuda:0")
+    except RuntimeError as exc:
+        raise RuntimeError("无法在 cuda:0 分配张量，本地模型清洗已停止。") from exc
+
+
+def resolve_torch_dtype() -> torch.dtype:
+    require_cuda()
+    if torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
+def load_local_chat_model(model_path: Path):
+    global _LOCAL_MODEL, _LOCAL_TOKENIZER
+    if _LOCAL_MODEL is not None and _LOCAL_TOKENIZER is not None:
+        return _LOCAL_MODEL, _LOCAL_TOKENIZER
+
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    require_cuda()
+    _LOCAL_TOKENIZER = AutoTokenizer.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+    )
+    _LOCAL_MODEL = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        dtype=resolve_torch_dtype(),
+        device_map="cuda:0",
+        trust_remote_code=True,
+    )
+    _LOCAL_MODEL.eval()
+    return _LOCAL_MODEL, _LOCAL_TOKENIZER
 
 
 def clean_line(line: str) -> str:
-    line = unicodedata.normalize("NFKC", line)
+    # NFC 只合并等价 Unicode 序列，不会像 NFKC 那样把中文全角标点折叠成半角。
+    line = unicodedata.normalize("NFC", line)
     line = CONTROL_CHAR_RE.sub("", line)
     line = IMAGE_RE.sub(r"\1", line)
     line = LINK_RE.sub(r"\1", line)
@@ -57,11 +140,72 @@ def clean_line(line: str) -> str:
         line = " ".join(part.strip() for part in line.strip(" |").split("|") if part.strip())
 
     line = line.replace("**", "").replace("__", "").replace("`", "")
+    line = MD_ESCAPE_RE.sub(r"\1", line)
+    line = LATIN_PUNCTUATION_SPACE_RE.sub(" ", line)
+    if re.search(rf"[{CJK_RANGE}]", line):
+        line = CJK_CONTEXT_PUNCTUATION_RE.sub(
+            lambda match: match.group(0).translate(ASCII_TO_CJK_PUNCTUATION),
+            line,
+        )
+        line = CJK_CONTEXT_PERIOD_RE.sub("。", line)
+        line = CJK_NUMBERED_ITEM_RE.sub(r"（\1）", line)
     return SPACE_RE.sub(" ", line).strip()
+
+
+def is_page_number_line(line: str) -> bool:
+    """识别独立成行的页码：5 / - 5 - / ·5· / 第 5 页 / 5 / 358。"""
+    compact = line.strip()
+    if not compact or len(compact) > 12:
+        return False
+    if PAGE_LABEL_RE.fullmatch(compact) or PAGE_RATIO_RE.fullmatch(compact):
+        return True
+    stripped = DECORATION_RE.sub("", compact)
+    return bool(stripped) and stripped.isdigit() and len(stripped) <= 4
+
+
+def merge_paragraphs(lines: list[str]) -> list[str]:
+    """把被硬换行和分页拆断的句子合并为连续段落。"""
+    paragraphs: list[str] = []
+    for line in lines:
+        if not paragraphs:
+            paragraphs.append(line)
+            continue
+
+        previous = paragraphs[-1]
+        starts_new = (
+            previous[-1] in TERMINAL_PUNCTUATION
+            or len(previous) < 12
+            or (bool(STRUCTURE_START_RE.match(previous)) and len(previous) < 30)
+            or STRUCTURE_START_RE.match(line) is not None
+            or FOOTNOTE_START_RE.match(line) is not None
+        )
+        if starts_new:
+            paragraphs.append(line)
+            continue
+
+        if previous.endswith("-") and line[:1].isascii() and line[:1].islower():
+            paragraphs[-1] = previous[:-1] + line  # 英文跨行断词还原
+        elif (
+            previous[-1:].isascii() and previous[-1:].isalnum()
+            and line[:1].isascii() and line[:1].isalnum()
+        ):
+            paragraphs[-1] = previous + " " + line  # 拉丁词之间补空格
+        elif (
+            previous[-1:] in ".,!?;:)]}\"'"
+            and line[:1].isascii()
+            and (line[:1].isalnum() or line[:1] in "\"'([")
+        ):
+            paragraphs[-1] = previous + " " + line
+        else:
+            paragraphs[-1] = previous + line
+
+    return paragraphs
 
 
 def clean_markdown(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = HTML_COMMENT_RE.sub("", text)  # 去掉 <!-- page N of M --> 之类的分页标记
+
     cleaned_lines = []
     previous_line: Optional[str] = None
     in_fence = False
@@ -74,15 +218,22 @@ def clean_markdown(text: str) -> str:
             continue
 
         line = clean_line(raw_line)
-        if not line:
+        if not line or line == previous_line:
             continue
-        if line == previous_line:
+        if is_page_number_line(line):
             continue
 
         cleaned_lines.append(line)
         previous_line = line
 
-    return "\n".join(cleaned_lines).strip()
+    # 文档级页眉页脚识别：整本书里高频重复出现的短行（如每页的"代序"）。
+    line_counts = Counter(cleaned_lines)
+    running_headers = {
+        line for line, count in line_counts.items() if count >= 5 and len(line) <= 20
+    }
+    body_lines = [line for line in cleaned_lines if line not in running_headers]
+
+    return "\n".join(merge_paragraphs(body_lines)).strip()
 
 
 def iter_markdown_files(input_dir: Path) -> Iterable[Path]:
@@ -110,7 +261,47 @@ def chunk_paragraphs(text: str, chunk_chars: int) -> list[str]:
     return chunks
 
 
-def chat_completion(api_base: str, model: str, user: str, max_tokens: int, timeout: int) -> tuple[str, str]:
+def local_chat_completion(model_path: Path, user: str, max_tokens: int) -> tuple[str, str]:
+    model, tokenizer = load_local_chat_model(model_path)
+    messages = [
+        {"role": "system", "content": LLM_SYSTEM_PROMPT},
+        {"role": "user", "content": user},
+    ]
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    inputs = tokenizer(prompt, return_tensors="pt")
+    inputs = {key: value.to("cuda:0") for key, value in inputs.items()}
+
+    with torch.inference_mode():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+
+    generated = outputs[0][inputs["input_ids"].shape[-1]:]
+    text = tokenizer.decode(generated, skip_special_tokens=True).strip()
+    finish_reason = "length" if generated.shape[-1] >= max_tokens else "stop"
+    return text, finish_reason
+
+
+def chat_completion(
+    api_base: str,
+    model: str,
+    user: str,
+    max_tokens: int,
+    timeout: int,
+    hf_model_path: Optional[Path] = None,
+) -> tuple[str, str]:
+    if hf_model_path is not None:
+        return local_chat_completion(hf_model_path, user, max_tokens)
+
     payload = json.dumps(
         {
             "model": model,
@@ -168,6 +359,7 @@ def llm_clean_chunk(chunk: str, args: argparse.Namespace) -> tuple[str, str]:
             user=chunk,
             max_tokens=args.max_tokens,
             timeout=args.timeout,
+            hf_model_path=args.hf_model_path,
         )
     except RuntimeError as exc:
         print(f"\n[llm] request failed, keeping rule-cleaned text: {exc}")
@@ -260,7 +452,7 @@ def assemble_llm_cache(args: argparse.Namespace) -> None:
             if len(text) < args.min_chars:
                 continue
             if not args.no_titles:
-                fout.write(unicodedata.normalize("NFKC", cache_file.stem).strip())
+                fout.write(unicodedata.normalize("NFC", cache_file.stem).strip())
                 fout.write("\n")
             fout.write(text)
             fout.write("\n\n")
@@ -296,7 +488,7 @@ def write_corpus(
                 continue
 
             if include_titles:
-                fout.write(unicodedata.normalize("NFKC", path.stem).strip())
+                fout.write(unicodedata.normalize("NFC", path.stem).strip())
                 fout.write("\n")
             fout.write(text)
             fout.write("\n\n")
@@ -353,6 +545,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--api-base", default=DEFAULT_API_BASE, help="OpenAI-compatible API base URL.")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Model name served at --api-base.")
+    parser.add_argument(
+        "--hf-model-path",
+        type=Path,
+        default=None,
+        help="Optional local Hugging Face model path; when set, use local generation instead of HTTP API.",
+    )
     parser.add_argument(
         "--chunk-chars",
         type=int,
