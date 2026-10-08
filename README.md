@@ -2,7 +2,7 @@
 
 A minimal from-scratch LLM implementation in PyTorch, featuring a LLaMA-style decoder architecture (RMSNorm + SwiGLU + causal self-attention) with tied input/output embeddings.
 
-Training follows a two-stage pipeline: **pretraining** on a raw Chinese corpus, then **SFT** on instruction data (COIG-CQIA). Checkpoints of the two stages are stored in separate directories so an SFT run can never overwrite your pretrained base.
+Training follows a layered pipeline: **pretraining** on a raw Chinese corpus (Chinese C4), optional **domain-adaptive pretraining** on a reviewed psychology corpus, then **SFT** on instruction data (COIG-CQIA and/or generated psychology QA). Each stage writes to its own checkpoint directory so a later stage can never overwrite an earlier base.
 
 ## Architecture
 
@@ -44,6 +44,7 @@ dropout      0.1
 │   ├── convert_psycho_pdfs.py    # Convert psychology PDFs to Markdown
 │   ├── prepare_psycho_data.py    # Clean Markdown into a plain-text corpus
 │   ├── quality_filter_psycho.py  # LLM-based OCR quality filter for psychology corpus
+│   ├── generate_psycho_sft.py    # Grounded psychology QA generation (Qwen3-8B)
 │   ├── run_psycho_pretrain_prep.sh # Persistent GPU cleaning/QC pipeline
 │   ├── export_book.py            # Export one reviewed book for inspection
 │   ├── train_tokenizer.py       # Train BPE tokenizer
@@ -53,8 +54,10 @@ dropout      0.1
 ├── analysis/
 │   ├── activation.py      # Extract per-layer hidden states
 │   └── attention_map.py   # Visualize attention weights
-├── checkpoints_pretrain/  # Stage 1 outputs (auto-created)
-├── checkpoints_sft/       # Stage 2 outputs (auto-created)
+├── checkpoints_pretrain/       # Stage 1 outputs (auto-created)
+├── checkpoints_psycho_pretrain/ # Domain-adaptive pretrain outputs
+├── checkpoints_sft/            # General SFT outputs
+├── checkpoints_psycho_sft*/    # Psychology SFT outputs (pure / mixed)
 ├── data/
 │   ├── psycho/
 │   │   ├── pdf/           # Local source PDFs (gitignored)
@@ -221,23 +224,78 @@ Validation found no HTML page markers, known `Thi` / `s` English word splits, or
 `measure.For` joins, and confirmed restoration of Chinese punctuation. The reviewed
 corpus is approximately 28.7 MB.
 
-#### Step 7: Build tokenizer and binary training data
+#### Step 7: Build binary training data
 
-Tokenizer models and `.bin` files are local build artifacts:
+Continued pretraining must use the original Chinese C4 tokenizer. Training a new
+psychology tokenizer would assign different meanings to the checkpoint's existing
+embedding rows. Tokenize the reviewed corpus with the original model:
 
 ```bash
-python scripts/train_tokenizer.py \
-  --input data/raw/psycho_train_qc.txt \
-  --model-prefix data/tokenizer/psycho_tokenizer
-
 python scripts/prepare_data.py \
   --input data/raw/psycho_train_qc.txt \
-  --tokenizer data/tokenizer/psycho_tokenizer.model \
+  --tokenizer data/tokenizer/tokenizer.model \
   --output data/processed/psycho_train.bin
 ```
 
 Before distributing Markdown or reviewed text, verify that you have the right to
 redistribute the underlying books. This pipeline does not grant content licenses.
+
+#### Step 8: Continue pretraining on psychology text
+
+Load the Chinese C4 model weights while resetting the optimizer, scheduler, epoch,
+and step counters for the new corpus. Keep the domain checkpoints in a separate
+directory:
+
+```bash
+python training/train.py \
+  --train-bin data/processed/psycho_train.bin \
+  --learning-rate 3e-5 \
+  --warmup-steps 30 \
+  --max-steps 300 \
+  --save-every-steps 100 \
+  --checkpoint-dir checkpoints_psycho_pretrain \
+  --resume checkpoints_pretrain/latest.pt \
+  --reset-training-state
+```
+
+#### Step 9: Generate grounded psychology SFT data
+
+The generator reconstructs only high-confidence `keep` chunks (confidence >= 0.9,
+400–1800 chars) from the QC audit, re-validates their cache keys against the current
+Markdown, and uses local Qwen3-8B to create standalone question/answer pairs. The
+model may reject a chunk that cannot become self-contained QA; such chunks are
+audited as skips. Generation is cached after every sample (interrupt-safe resume)
+and requires CUDA — the script exits rather than falling back to CPU:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 nohup \
+  python -u scripts/generate_psycho_sft.py --limit 1000 \
+  </dev/null >logs/psycho_sft_generate.log 2>&1 &
+```
+
+Tasks rotate across four types — concept explanation, comparison, application
+analysis, misconception correction — and candidates round-robin across books so no
+single author dominates. Prompts require questions that stand alone without the
+source chunk, answers grounded in the chunk only, and theory/fact boundaries
+for classic (Jung/Freud) material.
+
+Reference run over the 5,520 eligible chunks:
+
+| Metric | Value |
+|---|---|
+| samples written | 1,000 |
+| model calls | 1,048 (2 cached from smoke test, 50 rejected) |
+| books covered | 50 (3–22 samples per book) |
+| task balance | 250 / 252 / 249 / 249 |
+| duplicate instructions | 0 |
+| context leakage (`根据上述文本` etc.) | 0 |
+| avg output length | ~229 chars |
+
+| File | Purpose | Git policy |
+|---|---|---|
+| `data/raw/psycho_sft_train.jsonl` | Training samples (`system` / `instruction` / `output` + source metadata) | committed |
+| `data/raw/psycho_sft_generation_audit.jsonl` | One decision per chunk (keep/skip + parsed JSON) | committed |
+| `logs/psycho_sft_generate*.log` | Runtime progress | ignored |
 
 **SFT data** — COIG-CQIA via HF mirror, balanced-sampled to 5000 examples across all 13 subsets (30 major / 122 minor task types):
 
@@ -306,6 +364,58 @@ Behavior details:
 - Cross-stage `--resume` (pretrain → SFT) loads **model weights only** and resets optimizer / scheduler / epoch counter, so the SFT run starts a fresh, shorter LR schedule. Same-stage `--resume` is a true continuation (optimizer + scheduler + epoch restored).
 - Running SFT **without** `--resume` prints a warning, because that trains from random init (fine for smoke tests, not for real results).
 
+### Stage 2b — Psychology SFT
+
+Two variants, both starting from the domain-adapted checkpoint
+(`checkpoints_psycho_pretrain/latest.pt`, loaded weights-only with optimizer reset):
+
+**Pure domain** (1,000 psychology samples, 3 epochs → 96 steps, ~1 min):
+
+```bash
+python training/train.py \
+  --sft-jsonl data/raw/psycho_sft_train.jsonl \
+  --tokenizer data/tokenizer/tokenizer.model \
+  --batch-size 8 --grad-accum-steps 4 \
+  --epochs 3 --learning-rate 5e-5 --warmup-steps 10 \
+  --checkpoint-dir checkpoints_psycho_sft \
+  --resume checkpoints_psycho_pretrain/latest.pt
+```
+
+Per-epoch running-average loss: 5.75 → 5.09 → 4.89.
+
+**Domain-weighted mix** (psycho ×2 = 2,000 + COIG-CQIA 5,000 = 7,000 rows,
+3 epochs → 657 steps). The mixed file is derived and regenerable, so it is not
+committed; rebuild it with:
+
+```bash
+python - <<'PY'
+import json, random
+from pathlib import Path
+
+def load(p):
+    return [json.loads(l) for l in open(p, encoding="utf-8") if l.strip()]
+
+domain, general = load("data/raw/psycho_sft_train.jsonl"), load("data/raw/coig_cqia_5k_normalized.jsonl")
+rows = [dict(s, mix_group="psycho", mix_repeat=i) for i in range(2) for s in domain]
+rows += [dict(s, mix_group="general") for s in general]
+random.Random(42).shuffle(rows)
+Path("data/raw/psycho_sft_mixed_train.jsonl").write_text(
+    "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n", encoding="utf-8")
+PY
+```
+
+Then train with `--sft-jsonl data/raw/psycho_sft_mixed_train.jsonl --warmup-steps 30
+--log-interval 20 --checkpoint-dir checkpoints_psycho_sft_mixed` (same other flags).
+
+Inference from either checkpoint:
+
+```bash
+python inference.py \
+  --checkpoint checkpoints_psycho_sft_mixed/latest.pt \
+  --prompt "请解释荣格理论中的集体无意识。" \
+  --max-tokens 180 --temperature 0.7 --top-k 20 --repetition-penalty 1.2
+```
+
 ### Stage 3 — Inference
 
 ```bash
@@ -321,7 +431,10 @@ python inference.py --prompt "请简要介绍一下人工智能。"
 | Directory | Written by | Contents |
 |---|---|---|
 | `checkpoints_pretrain/` | Stage 1 | `checkpoint_epochN.pt` + `latest.pt` (refreshed every 2000 steps) |
+| `checkpoints_psycho_pretrain/` | Step 8 (domain-adaptive pretrain) | `checkpoint_epoch0.pt` + `latest.pt` (refreshed every 100 steps) |
 | `checkpoints_sft/` | Stage 2 | `checkpoint_epochN.pt` + `latest.pt` |
+| `checkpoints_psycho_sft/` | Stage 2b (pure domain) | `checkpoint_epochN.pt` + `latest.pt` |
+| `checkpoints_psycho_sft_mixed/` | Stage 2b (domain-weighted mix) | `checkpoint_epochN.pt` + `latest.pt` |
 | `checkpoints/` | legacy | Kept only for backward compatibility |
 
 Each checkpoint stores `model`, `optimizer`, `scheduler`, `epoch`, `global_step`, `model_config`, and `train_args` (used to detect the stage on resume).
@@ -334,12 +447,44 @@ Results from a complete pretrain → SFT cycle on a single GPU, as a calibration
 |---|---|---|---|---|
 | Pretrain | 268,000 | ~26.6 h | ~3.85 (plateaued) | ~17.5B tokens seen (≈38 passes over the 460M-token corpus); effective batch 8×8×1024 ≈ 65k tokens/step; ~2.8 steps/s |
 | SFT | 234 (3 epochs × 78) | ~2 min | 4.53 → ~3.6 | Initial SFT loss ~4.5 confirms the pretrained base was loaded (vs ~350 when training from scratch) |
+| Psycho domain pretrain | 300 | ~2 min | 19.8 → ~7.5 (running avg) | 6.9M tokens ≈ 3 passes; lr 3e-5; weights-only resume via `--reset-training-state` |
+| Psycho SFT (pure) | 96 (3 epochs × 32) | ~1 min | 5.75 → 5.09 → 4.89 | 1,000 generated samples; effective batch 8×4 |
+| Psycho SFT (mixed) | 657 (3 epochs × 219) | ~3 min | ~7.6 → ~5.9 | 2,000 psycho (×2 weight) + 5,000 COIG-CQIA |
 
 Observed behavior:
 
 - **Base model** (`checkpoints_pretrain/latest.pt`): fluent grammar, but rambles in web-corpus style and ignores questions — the expected state before alignment.
 - **SFT model** (`checkpoints_sft/latest.pt`): answer-style responses within the `系统：/用户：/助手：` template, stops at EOS.
+- **Psycho SFT models** (`checkpoints_psycho_sft*/latest.pt`): answer-style Chinese responses within the same template, with a psychology-tutor system prompt baked into the generated data.
 - **Known limitations at this scale**: domain-skewed knowledge (the corpus sample is agriculture-heavy), occasional UNK tokens (`⁇`) from vocab coverage, and token repetition. Repetition can be mitigated at inference time with `--temperature 0.7 --top-k 20 --repetition-penalty 1.2`.
+
+#### Psychology model: effects and limitations
+
+What the psycho SFT checkpoints can realistically do:
+
+- Answer questions about classic analytical-psychology concepts that the training
+  corpus covers densely — collective unconscious, archetypes, complexes, persona,
+  introversion/extraversion, individuation, Freud–Jung differences, dream/symbol
+  interpretation, transference.
+- Produce plausible short explanations and comparisons in the domain's register,
+  stopping at EOS within the chat template.
+- Serve as a compact demo of the full pipeline: book PDFs → cleaned corpus →
+  reviewed pretraining text → domain-adaptive pretraining → generated QA → SFT.
+
+Honest limitations (verified by held-out inference, e.g. "什么是投射"):
+
+- **Semantic drift on unseen questions**: the model stays in Q&A format but drifts
+  off-topic; output looks fluent while being unreliable. Adding 5k general
+  instructions (mixed run, 657 steps) did not fix this — the bottleneck is not
+  SFT data volume.
+- **Bottleneck is the 50.5M-parameter base** and its pretraining scale (~460M
+  unique tokens). More SFT epochs on 1k–7k samples would overfit rather than
+  generalize.
+- Do not treat it as a source of psychological facts, diagnoses, or crisis advice.
+
+Recommended next step: reuse this data pipeline (QC → domain pretrain corpus →
+grounded QA generation) on a 0.5B–1.5B Chinese base with QLoRA on the same 24GB
+GPU; the generated `psycho_sft_train.jsonl` is model-agnostic JSONL.
 
 Practical notes:
 

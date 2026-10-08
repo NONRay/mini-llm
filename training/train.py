@@ -125,6 +125,15 @@ def parse_args():
         help="Resume from a checkpoint path.",
     )
     parser.add_argument(
+        "--reset-training-state",
+        action="store_true",
+        help=(
+            "With --resume, load model weights only and restart the optimizer, "
+            "scheduler, epoch, and step counters. Use for continued pretraining "
+            "on a new corpus."
+        ),
+    )
+    parser.add_argument(
         "--no-compile",
         action="store_true",
         help="Disable torch.compile.",
@@ -180,6 +189,9 @@ def save_checkpoint(path: Path, model, optimizer, scheduler, epoch, global_step,
 
 def main():
     args = parse_args()
+    if args.reset_training_state and args.resume is None:
+        raise ValueError("--reset-training-state requires --resume.")
+
     device = torch.device(args.device)
     set_seed(train_config.seed)
 
@@ -279,18 +291,22 @@ def main():
         resume_sft = bool(resume_args.get("sft_jsonl"))
         same_stage = resume_sft == sft_mode
 
-        if same_stage:
+        if same_stage and not args.reset_training_state:
             optimizer.load_state_dict(checkpoint["optimizer"])
             scheduler.load_state_dict(checkpoint["scheduler"])
             start_epoch = checkpoint["epoch"] + 1
             global_step = checkpoint["global_step"]
             print(f"Resumed from {args.resume} at epoch={start_epoch} step={global_step}")
         else:
-            # 跨阶段（如 pretrain -> SFT）：只加载模型权重，
-            # 优化器/调度器/epoch 计数全部重新开始，避免沿用旧阶段的学习率轨迹
+            # 跨阶段或更换预训练语料时只加载模型权重，重新开始优化状态和计数。
+            transition = (
+                "training state reset"
+                if args.reset_training_state
+                else f"{'sft' if resume_sft else 'pretrain'} -> {stage}"
+            )
             print(
                 f"Loaded model weights from {args.resume} "
-                f"({'sft' if resume_sft else 'pretrain'} -> {stage}); "
+                f"({transition}); "
                 "optimizer/scheduler reset, epochs restart from 0"
             )
 

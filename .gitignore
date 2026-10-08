@@ -67,6 +67,8 @@ data/raw/*
 !data/raw/sft_zh_train.txt
 !data/raw/psycho_train_qc.txt
 !data/raw/psycho_qc_audit.jsonl
+!data/raw/psycho_sft_train.jsonl
+!data/raw/psycho_sft_generation_audit.jsonl
 
 # Jupyter
 .ipynb_checkpoints/
